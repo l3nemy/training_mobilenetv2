@@ -3,3 +3,4 @@ my_data/
 *.csv
 *.png
 *.jpg
+.DS_Store

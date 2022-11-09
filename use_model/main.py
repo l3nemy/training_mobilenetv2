@@ -1,5 +1,6 @@
 import os
 from typing import Any, Callable, Optional
+import threading
 
 import numpy as np
 import pandas as pd
@@ -7,10 +8,11 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 import torchvision
 from torchvision import models
 from torchvision.datasets import VisionDataset
-from torchvision.transforms import Resize, Normalize, ToTensor, CenterCrop
+from torchvision.transforms import Resize, Normalize, ToTensor, CenterCrop, GaussianBlur
 import torchmetrics
 
 import cv2
@@ -18,64 +20,15 @@ from PIL import Image
 
 import pytorch_lightning as pl
 
+import onnx2torch
+
+
 QUANTIZE = True
+CAMERA_WIDTH = 224
+CAMERA_HEIGHT = 224
 
 if QUANTIZE:
     torch.backends.quantized.engine = 'qnnpack'
-
-
-class Model(pl.LightningModule):
-    def __init__(self, model, learning_rate):
-        super().__init__()
-
-        self.learning_rate = learning_rate
-        self.model = model
-
-        self.save_hyperparameters(ignore=['model'])
-
-        self.train_acc = torchmetrics.Accuracy()
-        self.valid_acc = torchmetrics.Accuracy()
-        self.test_acc = torchmetrics.Accuracy()
-
-    def forward(self, x):
-        return self.model(x)
-
-    def _shared_step(self, batch):
-        features, actual_labels = batch
-        logits = self(features)
-        loss = F.cross_entropy(logits, actual_labels)
-        predicted_labels = torch.argmax(logits, dim=1)
-
-        return loss, actual_labels, predicted_labels
-
-    def training_step(self, batch, batch_idx):
-        loss, actual_labels, predicted_labels = self._shared_step(batch)
-        self.log("train_loss", loss)
-
-        self.model.eval()
-        with torch.no_grad():
-            _, actual_labels, predicted_labels = self._shared_step(batch)
-        self.train_acc.update(predicted_labels, actual_labels)
-        self.log("train_acc", self.train_acc, on_epoch=True, on_step=False)
-
-        self.model.train()
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        loss, actual_labels, predicted_labels = self._shared_step(batch)
-        self.log("valid_loss", loss)
-        self.valid_acc(predicted_labels, actual_labels)
-        self.log("valid_acc", self.valid_acc, on_epoch=True,
-                 on_step=False, prog_bar=True)
-
-    def test_step(self, batch, batch_idx):
-        _, actual_labels, predicted_labels = self._shared_step(batch)
-        self.test_acc(predicted_labels, actual_labels)
-        self.log("test_acc", self.test_acc, on_epoch=True, on_step=False)
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-        return optimizer
 
 
 classes = {0: 'Speed limit (20km/h)',
@@ -124,48 +77,59 @@ classes = {0: 'Speed limit (20km/h)',
 
 
 def main():
-    orig_model = models.quantization.mobilenet_v2(
-        pretrained=False, quantize=False,)
+    ts_model = torch.load("traffic_sign_model.pt")
 
-    model: Model = Model(orig_model, 0.01)
-    orig_model.classifier[-1] = torch.nn.Linear(
-        in_features=1280,
-        out_features=43
-    )
-    model.load_state_dict(torch.load('./model'))
-    trainer = pl.Trainer(
-        max_epochs=50,
-        accelerator="auto",
-        devices="auto",
-    )
-    model.eval()
-    # model = torch.jit.script(model)
+    #l_model = torch.jit.load("lane_model.pt")
+    l_model = onnx2torch.convert('lane.onnx')
 
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 224)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 224)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, 36)
     pp = torchvision.transforms.Compose([
         Resize((32, 32)),
         ToTensor(),
         Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
     ])
+    preprocess = torchvision.transforms.Compose([
+        GaussianBlur((3, 3)),
+        Resize((200, 66)),
+        ToTensor(),
+        Normalize([1, 1, 1], [0.5, 0.5, 0.5])
+    ])
     with torch.no_grad():
         while True:
             ret, image = cap.read()
             image = image[:, :, [2, 1, 0]]
-            permuted = image
 
-            image = Image.fromarray(image)
-            input_tensor = pp(image)
-            input_batch = input_tensor.unsqueeze(0)
+            pil_image: Image.Image = Image.fromarray(image)
+            tm_input_tensor: Tensor = pp(pil_image)
+            tm_input_batch = tm_input_tensor.unsqueeze(0)
 
-            out: torch.Tensor = model(input_batch)
+            l_out: Tensor = l_model(torch.Tensor(img_preprocess(image)))
+            angle = l_out[0]
+
+            tm_out: Tensor = ts_model(tm_input_batch)
             # print(np.percentile(out.cpu().numpy()))
-            top = list(enumerate(out[0].softmax(dim=0)))
+            top = list(enumerate(tm_out[0].softmax(dim=0)))
             top.sort(key=lambda x: x[1], reverse=True)
+            print(f"angle: {angle}")
             for idx, val in top[:10]:
                 print(f"{val.item()*100:.2f}% {classes[idx]}")
+
+
+def img_preprocess(image):
+    height, _, _ = image.shape
+    # remove top half of the image, as it is not relavant for lane following
+    image = image[int(height/2):, :, :]
+    # Nvidia model said it is best to use YUV color space
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2YUV)
+    image = cv2.GaussianBlur(image, (3, 3), 0)
+    # input image size (200,66) Nvidia model
+    image = cv2.resize(image, (200, 66))
+    # normalizing, the processed image becomes black for some reason.  do we need this?
+    image = image / 255
+    return image
 
 
 if __name__ == '__main__':
